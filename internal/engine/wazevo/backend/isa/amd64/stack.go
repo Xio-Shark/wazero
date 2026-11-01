@@ -62,6 +62,42 @@ func UnwindStack(_, rbp, top uintptr, returnAddresses []uintptr) []uintptr {
 	return returnAddresses
 }
 
+// FrameEnd implements wazevo.frameEnd. It returns the address right after the
+// stack region owned by the compiled function whose frame pointer is rbp, and
+// returns 0 when the boundary cannot be determined.
+//
+// On amd64 the chain of frame pointers delimits the frames, and the frame
+// pointer of the caller is stored at the base of the current frame:
+//
+//	+-----------------+ <---- Caller_RBP == returned end address
+//	|   Caller frame  |
+//	+-----------------+
+//	|  argument area  |       ;; allocated by the caller for this function
+//	|  ReturnAddress  |
+//	|   Caller_RBP    | <---- RBP
+//	|   clobbered     |
+//	|   spill slots   |
+//	+-----------------+ <---- SP
+//
+// Everything between SP and the caller's frame pointer belongs to this
+// invocation: its own frame and the arguments and results the caller allocated
+// for it. That is exactly what a checkpoint has to restore, and it is a
+// constant amount regardless of how deep the recursion is.
+//
+// The outermost frame has no caller: the entry preamble zeroes RBP before
+// calling the function (see CompileEntryPreamble), so its stored value is 0 and
+// 0 is returned.
+func FrameEnd(sp, rbp, top uintptr) uintptr {
+	if rbp == 0 || rbp < sp || rbp+16 > top {
+		return 0
+	}
+	callerRBP := binary.LittleEndian.Uint64(stackView(sp, top)[rbp-sp:])
+	if callerRBP <= uint64(rbp) || callerRBP > uint64(top) {
+		return 0
+	}
+	return uintptr(callerRBP)
+}
+
 // GoCallStackView implements wazevo.goCallStackView.
 func GoCallStackView(stackPointerBeforeGoCall *uint64) []uint64 {
 	//                  (high address)

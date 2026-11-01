@@ -46,20 +46,42 @@ type (
 		// tryHandlers is the stack of active try_table exception handlers,
 		// used to match catch clauses when a throw exits to the dispatch loop.
 		tryHandlers []tryHandler
+		// tryHandlerStackBytes is the total size of the frame copies retained
+		// by active try handlers. It is accounted against callStackCeiling so
+		// that nested try_table entries cannot exceed the stack limit: without
+		// it, recursion through try_table could retain far more memory than
+		// the limit is meant to allow.
+		tryHandlerStackBytes uintptr
 		// pendingException holds the most recently caught exception, so handler
 		// code can read its params after re-entry.
 		pendingException *wasm.Exception
 	}
 
 	// tryHandler records the state at a try_table entry for exception handling.
-	// On match, we restore the stack to the checkpoint state and re-enter at returnAddress.
+	// On match, we restore the compiled frame to the checkpoint state and
+	// re-enter at returnAddress.
 	tryHandler struct {
-		// Cloned stack and state from the try_table entry checkpoint,
-		// using the same approach as experimental.Snapshot.
-		sp, fp, top    uintptr
+		// sp is the stack pointer at the Go call that entered the try_table, and
+		// fp is the frame pointer (only set on amd64). Both are absolute
+		// addresses in stack, not in the current callEngine stack if it grew.
+		sp, fp         uintptr
 		returnAddress  *byte
 		savedRegisters [64][2]uint64
-		stack          []byte // cloned stack
+		// stack is the callEngine stack the checkpoint was taken on, and top is
+		// its top. The stack can be replaced by a larger one while the handler
+		// is active, in which case restoring has to switch back to this one: an
+		// abandoned stack is never written to again, so it still holds the
+		// frames of the suspended callers.
+		stack []byte
+		top   uintptr
+		// frame holds a copy of the live stack starting at frameAddr, which is
+		// sp: [frameAddr, frameAddr+len(frame)). It ends where the frame that
+		// owns sp ends, so only the frame and its arguments are copied.
+		// Nothing above it can change while the handler is active, since that
+		// belongs to suspended callers, and everything below it is popped when
+		// the handler catches.
+		frame     []byte
+		frameAddr uintptr
 		// catchClauses describes what exceptions this handler catches.
 		catchClauses []wazevoapi.CatchClauseInstance
 		// localsSaveArea is a heap buffer where locals are mirrored inside
@@ -183,6 +205,27 @@ func alignedStackTop(s []byte) uintptr {
 	return stackAddr - (stackAddr & (16 - 1))
 }
 
+// stackBytesAt returns a byte slice backed by the given address, which must
+// point into the wasm stack.
+func stackBytesAt(addr, l uintptr) []byte {
+	var s []byte
+	//nolint:staticcheck
+	sh := (*reflect.SliceHeader)(unsafe.Pointer(&s))
+	sh.Data = addr
+	sh.Len = int(l)
+	sh.Cap = int(l)
+	return s
+}
+
+// stackBottom returns the bottom of the given stack as the compiled code sees
+// it, mirroring how it is set when the stack is created or grown.
+func stackBottom(s []byte) *byte {
+	if wazevoapi.StackGuardCheckEnabled {
+		return &s[wazevoapi.StackGuardCheckGuardPageSize]
+	}
+	return &s[0]
+}
+
 // Definition implements api.Function.
 func (c *callEngine) Definition() api.FunctionDefinition {
 	return c.parent.module.Source.FunctionDefinition(c.indexInModule)
@@ -276,6 +319,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 
 	// Clear any stale try_table handlers from a previous call.
 	c.tryHandlers = c.tryHandlers[:0]
+	c.tryHandlerStackBytes = 0
 
 	var paramResultPtr *uint64
 	if len(paramResultStack) > 0 {
@@ -331,6 +375,7 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// Ensures that we can reuse this callEngine even after an error.
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			c.tryHandlers = c.tryHandlers[:0]
+			c.tryHandlerStackBytes = 0
 		}
 	}()
 
@@ -620,8 +665,27 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			info := &me.parent.tryTableInfo[tryTableID]
 			returnAddress := c.execCtx.goCallReturnAddress
 			oldTop, oldSp := c.stackTop, uintptr(unsafe.Pointer(c.execCtx.stackPointerBeforeGoCall))
-			newSP, newFP, newTop, newStack := c.cloneStack(uintptr(len(c.stack)) + 16)
-			adjustClonedStack(oldSp, oldTop, newSP, newFP, newTop)
+			// Copy only the current compiled frame instead of the whole stack.
+			// Entering a try_table then costs O(frame) rather than O(stack),
+			// which matters for loops and, above all, for recursion through
+			// try_table where a whole-stack copy per active frame is quadratic.
+			// Callers' frames are left in place: nothing can modify them while
+			// this handler is active, so they don't need a copy.
+			frameEndAddr := frameEnd(oldSp, c.execCtx.framePointerBeforeGoCall, oldTop)
+			if frameEndAddr <= oldSp || frameEndAddr > oldTop {
+				// The frame boundary is unknown (e.g. the outermost frame on
+				// amd64). Fall back to the whole live region.
+				frameEndAddr = oldTop
+			}
+			frameLen := frameEndAddr - oldSp
+			// callStackCeiling is expressed in uint64 slots (see its
+			// definition), so compare against the byte budget it represents.
+			if c.tryHandlerStackBytes+frameLen > callStackCeiling*8 {
+				panic(wasmruntime.ErrRuntimeStackOverflow)
+			}
+			frame := make([]byte, frameLen)
+			copy(frame, stackBytesAt(oldSp, frameLen))
+			c.tryHandlerStackBytes += frameLen
 
 			// Allocate a heap buffer for locals so handlers can read throw-time values.
 			// Nested try_tables in the same function (ReuseLocals) share the enclosing handler's save area.
@@ -632,12 +696,14 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			}
 
 			c.tryHandlers = append(c.tryHandlers, tryHandler{
-				sp:             newSP,
-				fp:             newFP,
-				top:            newTop,
+				sp:             oldSp,
+				fp:             c.execCtx.framePointerBeforeGoCall,
+				top:            oldTop,
 				returnAddress:  returnAddress,
 				savedRegisters: c.execCtx.savedRegisters,
-				stack:          newStack,
+				stack:          c.stack,
+				frame:          frame,
+				frameAddr:      oldSp,
 				catchClauses:   info.CatchClauses,
 				moduleInstance: mod,
 				localsSaveArea: saveArea,
@@ -652,8 +718,10 @@ func (c *callEngine) callWithStack(ctx context.Context, paramResultStack []uint6
 			// Pop the most recent try handler and restore the locals save
 			// area pointer from the handler below (or clear it).
 			if len(c.tryHandlers) > 0 {
-				c.tryHandlers = c.tryHandlers[:len(c.tryHandlers)-1]
-				c.restoreLocalsSaveAreaPtr(len(c.tryHandlers) - 1)
+				last := len(c.tryHandlers) - 1
+				c.tryHandlerStackBytes -= uintptr(len(c.tryHandlers[last].frame))
+				c.tryHandlers = c.tryHandlers[:last]
+				c.restoreLocalsSaveAreaPtr(last - 1)
 			}
 			c.execCtx.exitCode = wazevoapi.ExitCodeOK
 			afterGoFunctionCallEntrypoint(c.execCtx.goCallReturnAddress, c.execCtxPtr,
@@ -688,22 +756,34 @@ func (c *callEngine) doHandleException(exn *wasm.Exception) bool {
 				// the nearest enclosing one (same-function reuse).
 				c.restoreLocalsSaveAreaPtr(i)
 
-				// Pop all handlers at and above this one.
+				// Copy out the handler before the slice is truncated below.
+				stack, top := h.stack, h.top
+				frame, frameAddr := h.frame, h.frameAddr
+				sp, fp := h.sp, h.fp
+				returnAddress, savedRegisters := h.returnAddress, h.savedRegisters
+
+				// Pop all handlers at and above this one, releasing their
+				// retained frame copies from the ceiling accounting.
+				for j := i; j < len(c.tryHandlers); j++ {
+					c.tryHandlerStackBytes -= uintptr(len(c.tryHandlers[j].frame))
+				}
 				c.tryHandlers = c.tryHandlers[:i]
 
 				// Store the caught exception so handler code can read params.
 				c.pendingException = exn
 
-				// Restore the cloned stack (like snapshot.doRestore).
-				spp := *(**uint64)(unsafe.Pointer(&h.sp))
-				c.stack = h.stack
-				c.stackTop = h.top
+				// Restore the frame in place on the stack it was saved from.
+				// Switching stacks is a no-op unless it was grown since the
+				// checkpoint.
+				c.stack = stack
+				c.stackTop = top
 				ec := &c.execCtx
-				ec.stackBottomPtr = &c.stack[0]
-				ec.stackPointerBeforeGoCall = spp
-				ec.framePointerBeforeGoCall = h.fp
-				ec.goCallReturnAddress = h.returnAddress
-				ec.savedRegisters = h.savedRegisters
+				ec.stackBottomPtr = stackBottom(stack)
+				copy(stackBytesAt(frameAddr, uintptr(len(frame))), frame)
+				ec.stackPointerBeforeGoCall = *(**uint64)(unsafe.Pointer(&sp))
+				ec.framePointerBeforeGoCall = fp
+				ec.goCallReturnAddress = returnAddress
+				ec.savedRegisters = savedRegisters
 
 				// Set the matched clause index in execCtx for compiled code to read.
 				ec.caughtExceptionClauseIdx = int64(clauseIdx)

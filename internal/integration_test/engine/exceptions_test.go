@@ -22,6 +22,8 @@ package adhoc
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
+	"runtime"
 	"testing"
 
 	"github.com/tetratelabs/wazero"
@@ -29,6 +31,7 @@ import (
 	"github.com/tetratelabs/wazero/experimental"
 	"github.com/tetratelabs/wazero/internal/platform"
 	"github.com/tetratelabs/wazero/internal/testing/require"
+	"github.com/tetratelabs/wazero/internal/wasm"
 	"github.com/tetratelabs/wazero/internal/wasmruntime"
 )
 
@@ -325,6 +328,151 @@ func testEHCatchOutside(t *testing.T, cfg wazero.RuntimeConfig) {
 	res, err := mod.ExportedFunction("run").Call(ctx)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), api.DecodeI32(res[0]))
+}
+
+// tryTableRecursionWasmHex is the reproducer of issue #2573: a function that
+// recurses through a try_table that has a catch_all clause.
+//
+//	(module
+//	  (func $rec (export "rec") (param i32) (result i32)
+//	    (if (i32.eqz (local.get 0)) (then (return (i32.const 0))))
+//	    (block $L (result i32)
+//	      (block $H
+//	        (try_table (result i32) (catch_all $H)
+//	          (call $rec (i32.sub (local.get 0) (i32.const 1))))
+//	        (br $L))
+//	      (i32.const -1))))
+const tryTableRecursionWasmHex = "0061736d0100000001060160017f017f030201000707010372656300000a24012200200045044041000f0b027f02401f7f010200200041016b10000b0c010b417f0b0b"
+
+// TestExceptionHandlingTryTableStackUsage verifies that entering a try_table
+// saves only the current frame, not the whole wasm stack. Before the fix, each
+// active handler retained a full-stack copy, so recursion through a try_table
+// allocated O(depth × stack): 2000 levels used over 200MB and bypassed
+// callStackCeiling.
+func TestExceptionHandlingTryTableStackUsage(t *testing.T) {
+	if !platform.CompilerSupported() {
+		t.Skip()
+	}
+
+	bin, err := hex.DecodeString(tryTableRecursionWasmHex)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	cfg := wazero.NewRuntimeConfigCompiler().
+		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling)
+	r := wazero.NewRuntimeWithConfig(ctx, cfg)
+	defer r.Close(ctx)
+
+	mod, err := r.InstantiateWithConfig(ctx, bin, wazero.NewModuleConfig().WithStartFunctions())
+	require.NoError(t, err)
+
+	const depth = 2000
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	res, err := mod.ExportedFunction("rec").Call(ctx, depth)
+	require.NoError(t, err)
+	require.Equal(t, int32(0), api.DecodeI32(res[0]))
+
+	runtime.ReadMemStats(&after)
+
+	// Each active handler retains one frame copy (a few dozen bytes) plus the
+	// fixed register save area (~1KiB), so this stays linear in depth at around
+	// 5KiB per level. A whole-stack copy per level needs over 200MiB for the same
+	// program, so the bound has room to spare without being flaky.
+	const maxAllocated = 32 << 20 // 32MiB
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > maxAllocated {
+		t.Fatalf("recursing %d try_tables allocated %d bytes, want at most %d",
+			depth, allocated, maxAllocated)
+	}
+}
+
+// TestExceptionHandlingTryTableAfterStackGrowth verifies that catching still
+// works when the wasm stack grew after the handler was set up. The handler
+// copies the frame to the heap but leaves the caller frames in place, so
+// restoring has to switch back to the stack the checkpoint was taken on.
+func TestExceptionHandlingTryTableAfterStackGrowth(t *testing.T) {
+	if !platform.CompilerSupported() {
+		t.Skip()
+	}
+
+	ctx := context.Background()
+	cfg := wazero.NewRuntimeConfigCompiler().
+		WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesExceptionHandling)
+	r := wazero.NewRuntimeWithConfig(ctx, cfg)
+	defer r.Close(ctx)
+
+	mod, err := r.InstantiateWithConfig(ctx, buildEHStackGrowthModule(),
+		wazero.NewModuleConfig().WithStartFunctions())
+	require.NoError(t, err)
+
+	// Deep enough that the initial 10KB stack has to grow several times
+	// between entering the try_table and throwing.
+	res, err := mod.ExportedFunction("run").Call(ctx, 2000)
+	require.NoError(t, err)
+	require.Equal(t, int32(42), api.DecodeI32(res[0]))
+}
+
+// buildEHStackGrowthModule builds a module whose exported "run" enters a
+// try_table and then recurses 2000 levels deep before throwing, so the
+// exception is caught by a handler that was set up on a smaller stack:
+//
+//	(tag $t)
+//	(func $deep (param i32)
+//	  (if (local.get 0)
+//	    (then (call $deep (i32.sub (local.get 0) (i32.const 1))) (return)))
+//	  (throw $t))
+//	(func (export "run") (param i32) (result i32)
+//	  (block
+//	    (try_table (catch_all 0)
+//	      (call $deep (local.get 0))))
+//	  (i32.const 42))
+func buildEHStackGrowthModule() []byte {
+	m := &wasm.Module{
+		// Type 0: (i32) -> (), type 1: (i32) -> (i32), type 2: () -> () for the tag.
+		TypeSection: []wasm.FunctionType{
+			{Params: []wasm.ValueType{wasm.ValueTypeI32}},
+			{Params: []wasm.ValueType{wasm.ValueTypeI32}, Results: []wasm.ValueType{wasm.ValueTypeI32}},
+			{},
+		},
+		TagSection:      []wasm.Tag{{Type: 2}},
+		FunctionSection: []wasm.Index{0, 1},
+		ExportSection: []wasm.Export{
+			{Type: wasm.ExternTypeFunc, Name: "run", Index: 1},
+		},
+	}
+
+	// $deep: local.get 0; if void; call $deep(0 - 1); return; end; throw 0.
+	m.CodeSection = append(m.CodeSection, wasm.Code{Body: []byte{
+		wasm.OpcodeLocalGet, 0,
+		wasm.OpcodeIf, 0x40, // void
+		wasm.OpcodeLocalGet, 0,
+		wasm.OpcodeI32Const, 0x01,
+		wasm.OpcodeI32Sub,
+		wasm.OpcodeCall, 0,
+		wasm.OpcodeReturn,
+		wasm.OpcodeEnd,      // end if
+		wasm.OpcodeThrow, 0, // throw tag 0
+		wasm.OpcodeEnd, // end function
+	}})
+
+	// run: block; try_table (catch_all 0); local.get 0; call $deep; end; end;
+	// i32.const 42; end.
+	m.CodeSection = append(m.CodeSection, wasm.Code{Body: []byte{
+		wasm.OpcodeBlock, 0x40, // void
+		wasm.OpcodeTryTable, 0x40, // void
+		1,                      // catch count
+		wasm.CatchKindCatchAll, // catch_all
+		0,                      // label 0 (the enclosing block)
+		wasm.OpcodeLocalGet, 0,
+		wasm.OpcodeCall, 0, // $deep
+		wasm.OpcodeEnd, // end try_table
+		wasm.OpcodeEnd, // end block
+		wasm.OpcodeI32Const, 42,
+		wasm.OpcodeEnd, // end function
+	}})
+
+	return encodeModule(m)
 }
 
 // TestExceptionHandlingCompilationCache verifies that

@@ -17,6 +17,13 @@ func unwindStack(sp, fp, top uintptr, returnAddresses []uintptr) []uintptr {
 	return arm64.UnwindStack(sp, fp, top, returnAddresses)
 }
 
+// frameEnd is a function to get the end address of the compiled function frame
+// that owns the given Go call site's stack and frame pointers, or 0 when it
+// cannot be determined. The implementation must be aligned with the ABI.
+func frameEnd(sp, fp, top uintptr) uintptr {
+	return arm64.FrameEnd(sp, fp, top)
+}
+
 // goCallStackView is a function to get a view of the stack before a Go call, which
 // is the view of the stack allocated in CompileGoFunctionTrampoline.
 func goCallStackView(stackPointerBeforeGoCall *uint64) []uint64 {
