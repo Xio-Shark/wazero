@@ -70,3 +70,35 @@ func TestAdjustClonedStack(t *testing.T) {
 	require.Equal(t, addressOf(&newStack[rbpIndex+32]), binary.LittleEndian.Uint64(newStack[rbpIndex+16:]))
 	require.Equal(t, addressOf(&newStack[rbpIndex+160]), binary.LittleEndian.Uint64(newStack[rbpIndex+32:]))
 }
+
+func TestFrameEnd(t *testing.T) {
+	// A stack with three frames, laid out like the compiled code does: the
+	// stack grows down, so the frame of each caller sits at a higher address,
+	// and at each frame pointer sits the caller's frame pointer.
+	stack := allocSlice(256)
+	base := uintptr(unsafe.Pointer(&stack[0]))
+	top := uintptr(unsafe.Pointer(&stack[len(stack)-1]))
+	innermost := base + 32
+	middle := base + 96
+	outermost := base + 160
+	binary.LittleEndian.PutUint64(stack[innermost-base:], uint64(middle))
+	binary.LittleEndian.PutUint64(stack[middle-base:], uint64(outermost))
+	binary.LittleEndian.PutUint64(stack[outermost-base:], 0) // no caller
+
+	for _, tc := range []struct {
+		name     string
+		sp, rbp  uintptr
+		expected uintptr
+	}{
+		{name: "innermost frame ends where its caller begins", sp: base, rbp: innermost, expected: middle},
+		{name: "middle frame ends where its caller begins", sp: base + 64, rbp: middle, expected: outermost},
+		{name: "outermost frame has no caller", sp: base + 128, rbp: outermost, expected: 0},
+		{name: "no frame pointer", sp: base, rbp: 0, expected: 0},
+		{name: "frame pointer below sp", sp: middle, rbp: innermost, expected: 0},
+		{name: "frame pointer past the top", sp: base, rbp: top, expected: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.expected, FrameEnd(tc.sp, tc.rbp, top))
+		})
+	}
+}
